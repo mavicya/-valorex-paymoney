@@ -26,6 +26,10 @@ class PayoutState(StatesGroup):
     waiting_wallet = State()
 
 
+class DepositState(StatesGroup):
+    waiting_amount = State()
+
+
 # ── Wheel display helper ───────────────────────────────────────────────────────
 
 WHEEL_DISPLAY = [
@@ -47,7 +51,8 @@ def wheel_sectors_text() -> str:
 # ── /start ────────────────────────────────────────────────────────────────────
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     args = message.text.split()
     referrer_id = None
     if len(args) > 1 and args[1].startswith("ref_"):
@@ -68,13 +73,12 @@ async def cmd_start(message: Message):
     is_admin = message.from_user.id in ADMIN_IDS
 
     if is_new:
-        # Welcome screen — hook
         await message.answer(
             f"⚡️ <b>ValoreX Money</b>\n\n"
             f"Вітаємо! Тобі одразу нараховано\n\n"
             f"<b>⭐ {WELCOME_STARS} Telegram Stars</b>\n\n"
             f"Виконуй завдання, запрошуй друзів та крути колесо фортуни — "
-            f"виводь реальні Stars та USDT.\n\n"
+            f"виводь реальні USDT, а зірки збирай для майбутніх ігор та кейсів!\n\n"
             f"📌 За кожні 3 / 5 / 10 запрошених — безкоштовний спін!",
             parse_mode="HTML",
         )
@@ -179,7 +183,6 @@ async def cb_referrals(call: CallbackQuery):
     spins = user["spins_available"] if user else 0
     link = f"https://t.me/ValoreXmoney_bot?start=ref_{uid}"
 
-    # Progress to next spin trigger
     next_trigger = next((t for t in sorted(SPIN_TRIGGERS) if t > count), None)
     progress_line = ""
     if next_trigger:
@@ -235,7 +238,6 @@ async def cb_wheel(call: CallbackQuery):
 
 @router.callback_query(F.data == "wheel_spin")
 async def cb_wheel_spin(call: CallbackQuery):
-    # Анімація — редагуємо повідомлення
     frames = ["🎡", "🌀", "💫", "🎯"]
     await call.answer()
 
@@ -365,7 +367,7 @@ async def process_promo(message: Message, state: FSMContext):
         )
 
 
-# ── Balance & payout ──────────────────────────────────────────────────────────
+# ── Balance & Deposit / Payout (USDT only) ─────────────────────────────────────
 
 @router.callback_query(F.data == "balance")
 async def cb_balance(call: CallbackQuery):
@@ -375,7 +377,7 @@ async def cb_balance(call: CallbackQuery):
     spins = user["spins_available"] if user else 0
     await call.message.edit_text(
         f"💰 <b>Мій баланс</b>\n\n"
-        f"⭐ Telegram Stars: <b>{int(stars)}</b>\n"
+        f"⭐ Telegram Stars: <b>{int(stars)}</b> (для ігор та кейсів)\n"
         f"💵 USDT: <b>{usdt:.2f}</b>\n"
         f"🎡 Спінів: <b>{spins}</b>",
         reply_markup=balance_keyboard(),
@@ -383,20 +385,51 @@ async def cb_balance(call: CallbackQuery):
     )
 
 
-@router.callback_query(F.data.in_({"payout_stars", "payout_usdt"}))
-async def cb_payout_start(call: CallbackQuery, state: FSMContext):
-    method = "stars" if call.data == "payout_stars" else "usdt"
-    user = await db.get_user(call.from_user.id)
-    available = user["stars"] if method == "stars" else user["usdt"]
-    if available <= 0:
-        await call.answer("❌ Недостатньо коштів для виплати", show_alert=True)
-        return
-    await state.update_data(method=method, available=available)
-    await state.set_state(PayoutState.waiting_amount)
-    icon = "⭐" if method == "stars" else "💵"
+# Поповнення гаманця
+@router.callback_query(F.data == "deposit")
+async def cb_deposit_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(DepositState.waiting_amount)
     await call.message.edit_text(
-        f"💸 <b>Виплата {method.upper()}</b>\n\n"
-        f"Доступно: <b>{available:.2f} {icon}</b>\n\n"
+        "📥 <b>Поповнення балансу (USDT)</b>\n\n"
+        "Введи суму для поповнення (у USDT):",
+        reply_markup=back_btn("balance"),
+        parse_mode="HTML",
+    )
+
+
+@router.message(DepositState.waiting_amount)
+async def deposit_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.strip().replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введи коректну суму (число більше 0):")
+        return
+    
+    await state.clear()
+    await db.adjust_balance(message.from_user.id, usdt=amount)
+    await message.answer(
+        f"✅ Баланс успішно поповнено на <b>{amount:.2f} USDT</b>!",
+        reply_markup=back_btn("main"),
+        parse_mode="HTML",
+    )
+
+
+# Виплата виключно для USDT
+@router.callback_query(F.data == "payout_usdt")
+async def cb_payout_start(call: CallbackQuery, state: FSMContext):
+    user = await db.get_user(call.from_user.id)
+    available = user["usdt"] if user else 0
+    if available <= 0:
+        await call.answer("❌ Недостатньо USDT для виплати", show_alert=True)
+        return
+    
+    await state.update_data(method="usdt", available=available)
+    await state.set_state(PayoutState.waiting_amount)
+    await call.message.edit_text(
+        f"💸 <b>Виплата USDT</b>\n\n"
+        f"Доступно: <b>{available:.2f} 💵</b>\n\n"
         f"Введи суму для виведення:",
         reply_markup=back_btn("balance"),
         parse_mode="HTML",
@@ -412,27 +445,17 @@ async def payout_amount(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введи коректну суму (число більше 0):")
         return
+
     data = await state.get_data()
     if amount > data["available"]:
         await message.answer(
             f"❌ Перевищує баланс ({data['available']:.2f}). Введи меншу суму:"
         )
         return
+
     await state.update_data(amount=amount)
-    method = data["method"]
-    if method == "usdt":
-        await state.set_state(PayoutState.waiting_wallet)
-        await message.answer("💳 Введи адресу USDT-гаманця (TRC-20):")
-    else:
-        await state.clear()
-        payout_id = await db.create_payout(message.from_user.id, method, amount, None)
-        await db.adjust_balance(message.from_user.id, stars=-amount)
-        await message.answer(
-            f"✅ Заявку #{payout_id} на виплату <b>{int(amount)} Stars</b> надіслано!\n"
-            "Адміністратор обробить її найближчим часом.",
-            reply_markup=back_btn("main"),
-            parse_mode="HTML",
-        )
+    await state.set_state(PayoutState.waiting_wallet)
+    await message.answer("💳 Введи адресу USDT-гаманця (TRC-20):")
 
 
 @router.message(PayoutState.waiting_wallet)
@@ -441,12 +464,15 @@ async def payout_wallet(message: Message, state: FSMContext):
     if len(wallet) < 20:
         await message.answer("❌ Схоже, адреса некоректна. Спробуй ще раз:")
         return
+
     data = await state.get_data()
     await state.clear()
+    
     payout_id = await db.create_payout(
         message.from_user.id, data["method"], data["amount"], wallet
     )
     await db.adjust_balance(message.from_user.id, usdt=-data["amount"])
+    
     await message.answer(
         f"✅ Заявку #{payout_id} на виплату <b>{data['amount']:.2f} USDT</b> надіслано!\n"
         f"Гаманець: <code>{wallet}</code>\n"
