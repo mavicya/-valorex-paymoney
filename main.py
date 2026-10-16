@@ -4,40 +4,53 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
 
-from config import BOT_TOKEN
-from database import init_db
-from handlers import user, admin
+from bot.handlers import admin, profile, start, tasks, vip, withdrawals
+from bot.middlewares.auth import AuthMiddleware
+from bot.utils.scheduler import scheduler
+from config import settings
+from database.engine import init_db
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger(__name__)
 
 
 async def main() -> None:
     await init_db()
-    logger.info("Database initialised")
 
     bot = Bot(
-        token=BOT_TOKEN,
+        token=settings.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = Dispatcher(storage=MemoryStorage())
 
-    # Admin router must be registered BEFORE user router so its
-    # IsAdmin filter takes priority on shared callback_data keys.
-    dp.include_router(admin.router)
-    dp.include_router(user.router)
+    storage = RedisStorage.from_url(settings.REDIS_URL)
+    dp = Dispatcher(storage=storage)
 
-    logger.info("Starting polling…")
+    # ── Middlewares ──
+    dp.message.middleware(AuthMiddleware())
+    dp.callback_query.middleware(AuthMiddleware())
+
+    # ── Routers ──
+    dp.include_router(admin.router)       # першим — щоб адмін-команди мали пріоритет
+    dp.include_router(start.router)
+    dp.include_router(vip.router)
+    dp.include_router(tasks.router)
+    dp.include_router(profile.router)
+    dp.include_router(withdrawals.router)
+
+    # ── Scheduler ──
+    scheduler.start()
+    logging.info("Scheduler started")
+
     try:
+        logging.info("Bot polling started")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        scheduler.shutdown()
         await bot.session.close()
-        logger.info("Bot stopped")
 
 
 if __name__ == "__main__":
